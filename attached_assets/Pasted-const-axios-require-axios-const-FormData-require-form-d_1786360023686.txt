@@ -1,0 +1,369 @@
+const axios = require('axios');
+const FormData = require('form-data');
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+const NVIDIA_MODEL = process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct';
+
+// WhatsApp formatting rule injected into every prompt
+const WA_FORMAT_RULE = `\nFORMATTING (critical): This response will be sent via WhatsApp. WhatsApp uses *single asterisks* for bold — NEVER use **double asterisks**. Do not use markdown headers (###). Bullet points with • or - are fine.`;
+
+const SYSTEM_PROMPT = `You are a knowledgeable botanist writing short, friendly plant profiles for a WhatsApp bot.
+Given a plant's scientific name, common name, and family, write a concise description covering:
+- A 1-2 sentence overview of what the plant is
+- Native region / typical habitat
+- Notable uses (medicinal, culinary, ornamental, etc.) if any are well known
+- One basic care or growing tip if it's commonly cultivated
+
+Keep it under 120 words total. Do not use markdown headers. Write in plain conversational sentences,
+short paragraphs are fine. If you are not confident about a specific fact, omit it rather than guessing.${WA_FORMAT_RULE}`;
+
+function buildUserPrompt({ scientificName, commonName, family, genus }) {
+  return (
+    `Plant details:\n` +
+    `Scientific name: ${scientificName}\n` +
+    `Common name: ${commonName || 'unknown'}\n` +
+    `Family: ${family || 'unknown'}\n` +
+    `Genus: ${genus || 'unknown'}\n\n` +
+    `Write the description now.`
+  );
+}
+
+async function callGroq(messages) {
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set');
+
+  const { data } = await axios.post(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      model: GROQ_MODEL,
+      messages,
+      temperature: 0.4,
+      max_tokens: 300,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 20000,
+    }
+  );
+
+  return data.choices?.[0]?.message?.content?.trim();
+}
+
+async function callNvidia(messages) {
+  if (!NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY not set');
+
+  const { data } = await axios.post(
+    'https://integrate.api.nvidia.com/v1/chat/completions',
+    {
+      model: NVIDIA_MODEL,
+      messages,
+      temperature: 0.4,
+      max_tokens: 300,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${NVIDIA_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 25000,
+    }
+  );
+
+  return data.choices?.[0]?.message?.content?.trim();
+}
+
+const QUESTION_SYSTEM_PROMPT = `You are an expert botanical and agricultural assistant for a WhatsApp bot called Flora Scan.
+You answer questions across the full range of plant and crop sciences, including:
+- Plant identification, species, taxonomy, and biology
+- Agronomy and crop production (rice, yam, maize, cassava, wheat, sorghum, cowpea, etc.)
+- Horticulture (fruits, vegetables, ornamentals, herbs)
+- Soil science and soil management (soil pH, fertility, structure, erosion, tillage)
+- Plant nutrition and fertilisation
+- Plant diseases, pests, and integrated pest management
+- Irrigation and water management
+- Plant genetics and breeding (general concepts)
+- Post-harvest handling and storage of crops
+- Agroforestry and intercropping
+- Health benefits and nutritional value of plants and crops
+- Medicinal, culinary, and industrial uses of plants
+- Gardening, landscaping, and plant care
+
+Language rules (very important):
+- Detect the language the user is writing in. They may write in English, Hausa, Igbo, or Yoruba.
+- Always reply in the SAME language the user used. If they write in Hausa, reply fully in Hausa. If Igbo, reply in Igbo. If Yoruba, reply in Yoruba. If English, reply in English.
+- If the message mixes languages, match the dominant one.
+
+Content rules:
+- Answer any question that touches on plants, crops, farming, soil, or agriculture — even indirectly (e.g. "What are the health benefits of rice?" or "How do I grow yam?"). Be accurate and helpful. Keep responses concise (under 200 words).
+- Where relevant, tailor advice to Nigerian and West African farming conditions, climate zones, and locally available inputs — but only where it genuinely applies.
+- If the question is clearly unrelated to plants, crops, soil, farming, or agriculture (e.g. politics, sports, finance), reply in the user's language with a polite decline and invite them to ask a plant or farming question.
+- Do not use markdown headers. Short paragraphs are fine.${WA_FORMAT_RULE}`;
+
+const DISEASE_REPORT_SYSTEM_PROMPT = `You are an expert plant pathologist and agricultural extension officer writing reports for Nigerian farmers and gardeners via a WhatsApp bot called Flora Scan.
+
+Language rule: Detect the language of the user's message and write the entire report in that same language (English, Hausa, Igbo, or Yoruba). If no user message language is detectable, default to English.
+
+Given information about a detected plant disease/condition and the plant it affects, write a clear, structured report with the following sections — use the exact bold labels shown:
+
+*🦠 Disease / Condition:* [name and one-sentence explanation of what it is]
+
+*🔍 Possible Causes:* [2–4 bullet points covering pathogens, environmental stress, pests, or cultural factors]
+
+*💊 Treatment Options:* [2–4 bullet points with specific fungicides, pesticides, or biological controls available in Nigeria where possible]
+
+*🛡️ Preventive Measures:* [2–4 bullet points on cultural practices to prevent recurrence]
+
+*🌾 Best Farming Practices:* [2–3 bullet points of good agronomic practices relevant to Nigerian conditions — rainy season timing, crop spacing, soil management, etc.]
+
+Rules:
+- Keep each section concise but actionable.
+- Mention Nigerian-relevant products, seasons, or practices naturally where they apply — do not force "Nigeria" into every line.
+- Preserve accurate plant origin and scientific information; do not falsely localise a plant's native region.
+- Do not use markdown headers or horizontal rules — only the bold labels shown above.
+- Write in plain, friendly language a smallholder farmer can understand.
+- Total response should be under 350 words.${WA_FORMAT_RULE}`;
+
+async function callAI(messages, maxTokens = 300) {
+  try {
+    const { data } = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      { model: GROQ_MODEL, messages, temperature: 0.4, max_tokens: maxTokens },
+      {
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 25000,
+      }
+    );
+    const result = data.choices?.[0]?.message?.content?.trim();
+    if (result) return result;
+  } catch (err) {
+    console.error('Groq failed:', err.response?.data?.error?.message || err.message);
+  }
+
+  try {
+    const { data } = await axios.post(
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+      { model: NVIDIA_MODEL, messages, temperature: 0.4, max_tokens: maxTokens },
+      {
+        headers: { Authorization: `Bearer ${NVIDIA_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 30000,
+      }
+    );
+    const result = data.choices?.[0]?.message?.content?.trim();
+    if (result) return result;
+  } catch (err) {
+    console.error('Nvidia NIM failed:', err.response?.data?.error?.message || err.message);
+  }
+
+  return null;
+}
+
+/**
+ * Generates a natural-language plant description.
+ * Tries Groq first, falls back to Nvidia NIM if Groq fails or is unconfigured.
+ * Returns null if both fail or neither key is configured, so callers can degrade gracefully.
+ */
+async function generateDescription(plantInfo) {
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: buildUserPrompt(plantInfo) },
+  ];
+
+  const result = await callAI(messages);
+  if (result) return { text: result };
+  return null;
+}
+
+/**
+ * Answers a plant-related question.
+ * Politely declines if the question is not about plants.
+ * Accepts an optional history array of {role, content} objects for context.
+ * Returns null if both AI providers fail.
+ */
+async function answerQuestion(question, history = []) {
+  const messages = [
+    { role: 'system', content: QUESTION_SYSTEM_PROMPT },
+    ...history,
+    { role: 'user', content: question },
+  ];
+
+  return callAI(messages);
+}
+
+/**
+ * Generates a detailed disease report with Nigerian farming context.
+ * Takes detected disease results and plant info.
+ * Returns null if AI providers fail.
+ */
+async function generateDiseaseReport({ diseases, plantInfo }) {
+  const topDisease = diseases?.[0];
+  const diseaseName = topDisease?.description || topDisease?.name || 'Unknown condition';
+  const plantName = plantInfo?.commonName || plantInfo?.scientificName || 'the plant';
+  const scientificName = plantInfo?.scientificName || 'unknown';
+
+  const userPrompt =
+    `Plant affected: ${plantName} (${scientificName})\n` +
+    `Detected condition: ${diseaseName} (confidence: ${topDisease?.score}%)\n` +
+    (diseases?.length > 1
+      ? `Other possible conditions: ${diseases.slice(1).map(d => `${d.description || d.name} (${d.score}%)`).join(', ')}\n`
+      : '') +
+    `\nWrite the full disease report now.`;
+
+  const messages = [
+    { role: 'system', content: DISEASE_REPORT_SYSTEM_PROMPT },
+    { role: 'user', content: userPrompt },
+  ];
+
+  return callAI(messages, 600);
+}
+
+/**
+ * Transcribes a voice note buffer to text using Groq Whisper.
+ * mimeType should match the audio format (e.g. 'audio/ogg; codecs=opus').
+ * Returns the transcript string, or null if transcription fails.
+ */
+async function transcribeAudio(audioBuffer, mimeType) {
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set');
+
+  // Pick a safe file extension so Groq recognises the format
+  const ext = mimeType && mimeType.includes('mp4') ? 'm4a'
+    : mimeType && mimeType.includes('mp3') ? 'mp3'
+    : mimeType && mimeType.includes('webm') ? 'webm'
+    : 'ogg'; // WhatsApp PTT is usually ogg/opus
+
+  const form = new FormData();
+  form.append('file', audioBuffer, { filename: `audio.${ext}`, contentType: mimeType || 'audio/ogg' });
+  form.append('model', 'whisper-large-v3');
+  form.append('response_format', 'text');
+
+  try {
+    const { data } = await axios.post(
+      'https://api.groq.com/openai/v1/audio/transcriptions',
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          ...form.getHeaders(),
+        },
+        timeout: 30000,
+      }
+    );
+    return typeof data === 'string' ? data.trim() : data?.text?.trim() || null;
+  } catch (err) {
+    console.error('Whisper transcription failed:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Feature 3: Fertilizer & Treatment Recommendations
+// ─────────────────────────────────────────────
+
+const FERTILIZER_SYSTEM_PROMPT = `You are an expert agricultural inputs advisor for Nigerian farmers, assisting via a WhatsApp bot called Flora Scan.
+
+Given a crop/plant name and optionally a disease or pest problem, provide specific fertilizer and treatment recommendations tailored to Nigeria.
+
+Structure your response using ONLY these exact bold labels:
+
+*🌿 Recommended Fertilizers:*
+[2–4 specific fertilizer products with NPK ratios and application rates. Include products commonly sold in Nigeria: NPK 15-15-15, NPK 20-10-10, Urea (46%N), CAN, DAP, SSP. Mention both basal and top-dress applications where relevant. Include poultry manure or compost as a low-cost organic option.]
+
+*💊 Pest & Disease Treatment:*
+[2–4 specific products with active ingredients and brand names sold in Nigeria, e.g. Cypermethrin 10EC, Emamectin benzoate (Proclaim), Mancozeb (Dithane M-45), Metalaxyl + Mancozeb (Ridomil Gold), Lambda-cyhalothrin (Karate). Include mixing rate per litre of water or per hectare.]
+
+*🌱 Organic / Low-cost Alternatives:*
+[2–3 organic or traditional remedies: neem leaf extract, wood ash, fermented compost tea, garlic spray, etc. Practical for smallholder farmers with limited cash.]
+
+*📅 Application Schedule:*
+[Brief timeline: when to apply fertilizer (at planting, 3 WAP, 6 WAP, etc.) and spraying frequency for disease/pest control.]
+
+Language rule: Detect the user's language (English, Hausa, Igbo, Yoruba) and reply in that same language.
+Rules: Keep each section concise and actionable. Focus on inputs available in Nigerian markets. Total response under 320 words. Do not use markdown headers — only the bold labels shown.${WA_FORMAT_RULE}`;
+
+/**
+ * Generates specific fertilizer and treatment recommendations for a crop/plant.
+ * @param {object} opts
+ * @param {string} opts.cropOrPlant   - crop or plant name
+ * @param {string} [opts.disease]     - detected disease or pest (optional)
+ * @param {string} [opts.question]    - original user question for language detection
+ */
+async function generateFertilizerAdvice({ cropOrPlant, disease, question }) {
+  const userPrompt =
+    `Crop/plant: ${cropOrPlant}\n` +
+    (disease ? `Disease/pest problem: ${disease}\n` : '') +
+    (question ? `User question: ${question}\n` : '') +
+    `\nWrite the fertilizer and treatment recommendations now.`;
+
+  const messages = [
+    { role: 'system', content: FERTILIZER_SYSTEM_PROMPT },
+    { role: 'user', content: userPrompt },
+  ];
+
+  return callAI(messages, 500);
+}
+
+// ─────────────────────────────────────────────
+// Feature 4: Crop Yield Estimator
+// ─────────────────────────────────────────────
+
+const YIELD_ESTIMATOR_SYSTEM_PROMPT = `You are an agricultural economist and agronomy advisor for Nigerian farmers, assisting via WhatsApp bot called Flora Scan.
+
+Given a crop type and farm size, provide a practical yield and profit estimate based on Nigerian farming conditions.
+
+Structure your response using ONLY these exact bold labels:
+
+*🌾 Crop & Farm Size:*
+[Confirm the crop and farm size in the user's unit, converted to hectares in brackets.]
+
+*📊 Expected Yield:*
+[Realistic yield range for Nigerian conditions — low, average, and high estimates. State in bags (50 kg) and kg. Mention 1–2 key factors that most affect yield (variety, fertilizer, rainfall).]
+
+*💰 Estimated Input Costs (NGN):*
+[Itemised breakdown: seeds/seedlings, fertilizer, pesticides/herbicides, land preparation, planting labour, weeding labour, harvesting labour, miscellaneous. Show cost per item and a TOTAL. Use realistic current Nigerian market prices (2024–2025).]
+
+*💵 Revenue & Profit Estimate (NGN):*
+[Revenue at average current farm-gate price for that crop in Nigeria. Show:
+  Revenue (low scenario) – Input Cost = Net Profit (low)
+  Revenue (average scenario) – Input Cost = Net Profit (average)
+Briefly note price volatility and peak harvest season effect.]
+
+*📈 Tips to Maximise Your Yield:*
+[2–3 specific, practical tips for this crop in Nigerian conditions — improved variety names, optimal planting date, key fertilizer timing, etc.]
+
+Language rule: Detect the user's language (English, Hausa, Igbo, Yoruba) and reply in that same language.
+Rules: Use realistic 2024–2025 Nigerian market prices and yield data. Acknowledge price volatility. Keep total response under 420 words. Do not use markdown headers — only the bold labels shown.${WA_FORMAT_RULE}`;
+
+/**
+ * Generates a yield, cost, and profit estimate for a given crop and farm size.
+ * @param {object} opts
+ * @param {string} opts.crop           - crop name (e.g. "maize", "tomato")
+ * @param {number} opts.farmSize       - numeric farm size
+ * @param {string} opts.farmSizeUnit   - unit (e.g. "hectare", "acre", "plot")
+ * @param {string} [opts.lang]         - detected language code
+ */
+async function estimateCropYield({ crop, farmSize, farmSizeUnit, lang }) {
+  const userPrompt =
+    `[User language: ${lang || 'en'}]\n` +
+    `Crop: ${crop}\n` +
+    `Farm size: ${farmSize} ${farmSizeUnit}(s)\n` +
+    `\nProvide the yield, input cost, and profit estimate now.`;
+
+  const messages = [
+    { role: 'system', content: YIELD_ESTIMATOR_SYSTEM_PROMPT },
+    { role: 'user', content: userPrompt },
+  ];
+
+  return callAI(messages, 600);
+}
+
+module.exports = {
+  generateDescription,
+  answerQuestion,
+  generateDiseaseReport,
+  transcribeAudio,
+  generateFertilizerAdvice,
+  estimateCropYield,
+};

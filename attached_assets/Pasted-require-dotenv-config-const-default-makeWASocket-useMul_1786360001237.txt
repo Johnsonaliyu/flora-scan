@@ -1,0 +1,732 @@
+require('dotenv').config();
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+  Browsers,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const axios = require('axios');
+const FormData = require('form-data');
+const express = require('express');
+const QRCode = require('qrcode');
+const { generateDescription, answerQuestion, generateDiseaseReport, transcribeAudio, generateFertilizerAdvice, estimateCropYield } = require('./ai');
+const { textToSpeech } = require('./tts');
+
+const PLANTNET_API_KEY = process.env.PLANTNET_API_KEY;
+const PLANTNET_PROJECT = process.env.PLANTNET_PROJECT || 'all';
+
+if (!PLANTNET_API_KEY) {
+  console.error('Missing PLANTNET_API_KEY in .env — get one free at https://my.plantnet.org/');
+  process.exit(1);
+}
+
+// ---------- Language detection ----------
+function detectLanguage(text) {
+  const t = text.toLowerCase();
+  // Hausa markers
+  if (/\b(sannu|yaya|ina kwana|barka|ina|da|mai|don|kai|shi|mun|sun|suna|wannan|wani|akan|kuma|tare|yanzu|lokaci|aiki|gona|noma|tsire|bishiya|kwayoyi|ciyayi|abinci|ruwa|kasa|nau'i|kasar|lafiya|taimako|menene|yaushe|wane|wanda|amma|ko|ba|ne|ce|ya|ta|su|mu|ku|ni)\b/.test(t)) return 'ha';
+  // Igbo markers
+  if (/\b(nnọọ|kedụ|ndewo|igwe|chi|ndi|ọ|na|ya|ha|anyị|unu|ihe|ebe|oge|ọrụ|ugbo|osisi|mkpụrụ|akwụkwọ|ala|mmiri|ụmụ|ndị|maka|site|yana|ma|o|nke|ọ bụ|gịnị|ọ dị|kedu|biko|daalu|asụsụ)\b/.test(t)) return 'ig';
+  // Yoruba markers
+  if (/\b(ẹ káàbọ̀|ẹ káaro|e kaaro|e kaasan|e kaale|bawo|jẹ|ni|ti|fun|bi|ati|tabi|nitori|sibẹ|ṣugbọn|ilẹ|omi|eweko|igi|irugbin|oko|agbe|àjàrà|àgbàdo|isu|ẹfọ|ewe|eso|ododo|joko|ẹ jọ|ese|o dabo|pẹlẹ)\b/.test(t)) return 'yo';
+  return 'en';
+}
+
+const GREETINGS = {
+  en: /^(hi+|hello+|hey+|howdy|good\s*(morning|afternoon|evening|day|night)|what'?s up|sup|greetings|yo|hiya|helo|hy|hei|hai)\b/i,
+  ha: /^(sannu|barka\s*da|ina\s*kwana|ina\s*wuni|ina\s*yini|yaya\s*lafiya)/i,
+  ig: /^(nnọọ|ndewo|kedụ|ọ\s*dị\s*mma|how\s*di)/i,
+  yo: /^(ẹ\s*k[aá][ar]|e\s*k[aá][ar]|bawo|ẹ\s*káàbọ̀|ẹ\s*káabo)/i,
+};
+
+function buildGreeting(name, lang) {
+  const n = name || 'there';
+  const shared =
+    `📸 *Identify plants* — Send me a clear photo of any plant and I'll tell you exactly what it is.\n` +
+    `🦠 *Disease detection* — I'll check your plant photo for signs of disease.\n` +
+    `🌱 *Agronomy & crop Q&A* — Ask about rice, yam, maize, soil, fertilisers, and more.\n` +
+    `🧪 *Fertilizer & treatment advice* — Ask which fertilizers or treatments to use for any crop or plant problem.\n` +
+    `📊 *Crop yield estimator* — Tell me your crop and farm size and I'll estimate your yield, costs, and profit.\n` +
+    `💬 *Plant Q&A* — Any question about plants, gardening, or plant care.\n` +
+    `🎙️ *Voice notes* — Send a voice note and I'll reply with one too!\n`;
+
+  if (lang === 'ha') {
+    return `🌿 Sannu, *${n}!*\n\nNi ne *Flora Scan*, an gina ni don taimaka maka game da tsire-tsire da noma.\n\n*Abin da zan iya yi maka:*\n` + shared + `\n_Aika mini hoto na tsire ko tambaya ta noma don farawa!_ 🌻`;
+  }
+  if (lang === 'ig') {
+    return `🌿 Ndewo, *${n}!*\n\nAhụ m bụ *Flora Scan*, emebere m iji nyere gị aka n'ihe gbasara osisi na ọrụ ugbo.\n\n*Ihe m nwere ike ime:*\n` + shared + `\n_Ziga foto osisi ma ọ bụ ajụjụ ugbo iji bido!_ 🌻`;
+  }
+  if (lang === 'yo') {
+    return `🌿 Ẹ káàbọ̀, *${n}!*\n\nMo jẹ *Flora Scan*, a ṣẹda mi lati ràn ọ́ lọ́wọ́ pẹ̀lú ewéko àti iṣẹ́ àgbẹ̀.\n\n*Ohun tí mo lè ṣe:*\n` + shared + `\n_Fi fọto ewéko ránṣẹ́ tàbí béèrè ìbéèrè nípa àgbẹ̀ láti bẹ̀rẹ̀!_ 🌻`;
+  }
+  // English default
+  return (
+    `🌿 Good day, *${n}!*\n\nI'm *Flora Scan*, built by *Aliu Johnson Temitope*, a fellow of the *3MTT Airtel NextGen Program* (Fellow ID: FE/23/24184818).\n\n*Here's what I can do for you:*\n` +
+    shared +
+    `\n_Just send a plant photo, voice note, or type your plant question to get started!_ 🌻`
+  );
+}
+
+// ---------- Feature 3 & 4 helpers ----------
+
+// Detect fertilizer / treatment intent
+const FERTILIZER_REGEX = /\b(fertilizer|fertiliser|fertilize|fertilise|manure|npk|urea|treatment|spray|spraying|pesticide|herbicide|fungicide|insecticide|what.*apply|how.*treat|remedy|chemical|organic.*treat|dosage|dose|application rate|apply.*farm|weed.*control|pest.*control|how to cure|cure.*plant|plant.*medicine)\b/i;
+
+// Detect yield / profit estimation intent
+const YIELD_REGEX = /\b(yield|harvest estimate|how much.*get|how many bags|profit|income|revenue|produce|production estimate|estimate.*farm|farm.*estimate|how much can i|what.*earn|cost of farming|cost.*farm|input cost|farming profit|how profitable)\b/i;
+
+// Common Nigerian crops — sorted longest-first so multi-word names match before substrings
+// (e.g. "sweet potato" is checked before "potato", preventing false positives)
+const KNOWN_CROPS = [
+  'sweet potato', 'sugarcane', 'watermelon', 'groundnut', 'sunflower', 'cocoyam',
+  'pineapple', 'plantain', 'sorghum', 'cassava', 'cowpea', 'soybean', 'spinach',
+  'lettuce', 'cabbage', 'cucumber', 'sesame', 'moringa', 'papaya', 'banana',
+  'tomato', 'pepper', 'potato', 'millet', 'cotton', 'ginger', 'garlic', 'carrot',
+  'onion', 'melon', 'mango', 'guava', 'wheat', 'cocoa', 'beans', 'maize',
+  'pawpaw', 'orange', 'okra', 'rice', 'yam', 'corn',
+].sort((a, b) => b.length - a.length); // guarantee longest-first
+
+/**
+ * Parses a farm size number + unit from free text.
+ * Returns { size, unit } or null.
+ * Handles "half <unit>" as well as decimal/integer expressions.
+ */
+function parseFarmSize(text) {
+  const lower = text.toLowerCase();
+
+  // Handle word "half <unit>"
+  const halfMatch = lower.match(/\bhalf\s+(hectare|ha|acre|plot)\b/);
+  if (halfMatch) {
+    const rawUnit = halfMatch[1] === 'ha' ? 'hectare' : halfMatch[1];
+    return { size: 0.5, unit: rawUnit };
+  }
+
+  // Numeric expression: "2 hectares", "1.5 acres", "4 plots", etc.
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(hectare|hectares|ha|acre|acres|plot|plots|sqm|square\s*met(?:re|er)s?|sqft|square\s*fe(?:et|et))/i);
+  if (!match) return null;
+
+  const size = parseFloat(match[1]);
+  if (!size || size <= 0) return null; // reject 0 or NaN
+
+  const unit = match[2]
+    .toLowerCase()
+    .replace(/s$/, '')
+    .replace(/^ha$/, 'hectare')
+    .replace(/square\s*met(?:re|er)/, 'sqm')
+    .replace(/square\s*fe(?:et|et)/, 'sqft');
+
+  return { size, unit };
+}
+
+/**
+ * Parses a crop name from free text using word-boundary matching.
+ * Returns the matched crop string or null.
+ */
+function parseCropName(text) {
+  const lower = text.toLowerCase();
+  for (const crop of KNOWN_CROPS) {
+    // Escape spaces for multi-word crops, require word boundaries
+    const pattern = new RegExp(`\\b${crop.replace(/\s+/g, '\\s+')}\\b`);
+    if (pattern.test(lower)) return crop;
+  }
+  return null;
+}
+
+// ---------- WhatsApp formatting sanitizer ----------
+// LLMs sometimes produce **double-asterisk** markdown bold even when instructed
+// not to. WhatsApp only renders *single-asterisk* bold, so we strip doubles here.
+function sanitizeForWhatsApp(text) {
+  if (!text) return text;
+  // **bold** → *bold*  (non-greedy, handles multi-word phrases)
+  return text.replace(/\*\*([^*]+)\*\*/g, '*$1*');
+}
+
+
+// ---------- PlantNet identification ----------
+async function identifyPlant(imageBuffer) {
+  const form = new FormData();
+  form.append('images', imageBuffer, { filename: 'plant.jpg', contentType: 'image/jpeg' });
+  form.append('organs', 'auto');
+
+  const url = `https://my-api.plantnet.org/v2/identify/${PLANTNET_PROJECT}?api-key=${PLANTNET_API_KEY}&include-related-images=false&no-reject=false`;
+
+  const { data } = await axios.post(url, form, {
+    headers: form.getHeaders(),
+    timeout: 20000,
+  });
+
+  if (!data.results || data.results.length === 0) return null;
+
+  return data.results.slice(0, 3).map((r) => ({
+    score: (r.score * 100).toFixed(1),
+    scientificName: r.species.scientificNameWithoutAuthor,
+    commonNames: r.species.commonNames || [],
+    family: r.species.family?.scientificNameWithoutAuthor,
+    genus: r.species.genus?.scientificNameWithoutAuthor,
+  }));
+}
+
+// ---------- PlantNet disease identification ----------
+async function identifyDisease(imageBuffer) {
+  const form = new FormData();
+  form.append('images', imageBuffer, { filename: 'plant.jpg', contentType: 'image/jpeg' });
+
+  const url = `https://my-api.plantnet.org/v2/diseases/identify?api-key=${PLANTNET_API_KEY}&include-related-images=false&no-reject=true&nb-results=5`;
+
+  try {
+    const { data } = await axios.post(url, form, {
+      headers: form.getHeaders(),
+      timeout: 20000,
+    });
+
+    console.log('Disease API raw results:', JSON.stringify(data.results?.slice(0, 3)));
+
+    if (!data.results || data.results.length === 0) return null;
+
+    return data.results.map((r) => ({
+      score: (r.score * 100).toFixed(1),
+      name: r.name,
+      description: r.description || null,
+    }));
+  } catch (err) {
+    console.error('Disease API error:', err.response?.status, err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ---------- Format reply text ----------
+function formatHeader(top) {
+  const commonName = top.commonNames[0] || 'No common name found';
+  let reply = `🌿 *Plant identified!*\n\n`;
+  reply += `*Name:* ${commonName}\n`;
+  reply += `*Scientific name:* _${top.scientificName}_\n`;
+  if (top.family) reply += `*Family:* ${top.family}\n`;
+  reply += `*Confidence:* ${top.score}%\n`;
+
+  if (top.commonNames.length > 1) {
+    reply += `*Also known as:* ${top.commonNames.slice(1, 4).join(', ')}\n`;
+  }
+  return reply;
+}
+
+function formatAlternates(matches) {
+  if (matches.length <= 1) return '';
+  let reply = `\n_Other possible matches:_\n`;
+  matches.slice(1).forEach((m) => {
+    reply += `• ${m.commonNames[0] || m.scientificName} (${m.score}%)\n`;
+  });
+  return reply;
+}
+
+const NOT_FOUND_MESSAGE =
+  "I couldn't confidently identify this plant. 🌱\n\n" +
+  'Tips for a better shot:\n' +
+  '• Get close to a single leaf or flower\n' +
+  '• Use good natural light\n' +
+  '• Avoid blurry or shadowed photos\n\n' +
+  'Try sending another photo!';
+
+// ---------- Format disease results ----------
+function formatDiseaseResult(diseases) {
+  if (!diseases || diseases.length === 0) return null;
+
+  const top = diseases[0];
+  if (parseFloat(top.score) < 5) return null; // skip only if extremely low confidence
+
+  let reply = `\n🦠 *Disease Check:*\n`;
+  reply += `*Most likely:* ${top.description || top.name} _(${top.score}% confidence)_\n`;
+
+  if (diseases.length > 1) {
+    reply += `\n_Other possible conditions:_\n`;
+    diseases.slice(1).forEach((d) => {
+      reply += `• ${d.description || d.name} (${d.score}%)\n`;
+    });
+  }
+
+  return reply;
+}
+
+// ---------- Conversation memory ----------
+// Stores per-user context: last identified plant + recent message history
+const MAX_HISTORY = 10; // max messages kept (5 exchanges)
+const MEMORY_TTL_MS = 30 * 60 * 1000; // forget after 30 min of inactivity
+
+const userMemory = new Map(); // remoteJid -> { lastPlant, messages, updatedAt }
+
+function getMemory(jid) {
+  const entry = userMemory.get(jid);
+  if (!entry) return { lastPlant: null, messages: [] };
+  // Expire stale entries
+  if (Date.now() - entry.updatedAt > MEMORY_TTL_MS) {
+    userMemory.delete(jid);
+    return { lastPlant: null, messages: [] };
+  }
+  return entry;
+}
+
+function setMemory(jid, patch) {
+  const current = getMemory(jid);
+  userMemory.set(jid, { ...current, ...patch, updatedAt: Date.now() });
+}
+
+function pushMessage(jid, role, content) {
+  const mem = getMemory(jid);
+  const messages = [...mem.messages, { role, content }].slice(-MAX_HISTORY);
+  setMemory(jid, { messages });
+}
+
+// ---------- QR web server ----------
+let currentQR = null;
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  if (!currentQR) {
+    return res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
+      <h2>⏳ Waiting for QR code...</h2>
+      <p>The bot is connecting. Refresh this page in a few seconds.</p>
+      <script>setTimeout(()=>location.reload(),3000)</script>
+    </body></html>`);
+  }
+  QRCode.toDataURL(currentQR, { width: 400 }, (err, url) => {
+    if (err) return res.send('Error generating QR: ' + err.message);
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
+      <h2>📱 Scan with WhatsApp</h2>
+      <p>Open WhatsApp → ⋮ → Linked Devices → Link a Device → scan below</p>
+      <img src="${url}" style="border:4px solid #25D366;border-radius:12px"/>
+      <p style="color:gray;font-size:13px">QR refreshes every ~20s. Page auto-reloads.</p>
+      <script>setTimeout(()=>location.reload(),20000)</script>
+    </body></html>`);
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🌐 QR page running — open your Railway public URL in a browser to scan.\n`);
+});
+
+// ---------- WhatsApp bot ----------
+const processedMessages = new Set();
+const MAX_PROCESSED_CACHE = 500;
+
+let isRestarting = false;
+let reconnectDelay = 5000;   // starts at 5s, backs off to avoid rate-limiting
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+
+  const logger = pino({ level: 'silent' });
+
+  const sock = makeWASocket({
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Chrome'),
+    keepAliveIntervalMs: 15000,  // send keep-alive pings every 15s
+    connectTimeoutMs: 20000,     // give the handshake 20s before giving up
+  });
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      currentQR = qr;
+      console.log('📱 New QR code ready — open your Railway public URL in a browser to scan it.');
+    }
+
+    if (connection === 'open') {
+      currentQR = null;
+      reconnectDelay = 5000; // reset backoff on successful connection
+      console.log('✅ WhatsApp bot connected and ready.');
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed.', shouldReconnect ? `Reconnecting in ${reconnectDelay / 1000}s...` : 'Logged out.');
+
+      if (shouldReconnect && !isRestarting) {
+        isRestarting = true;
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(reconnectDelay * 1.5, 30000); // back off up to 30s
+        setTimeout(() => {
+          startBot().finally(() => { isRestarting = false; });
+        }, delay);
+      }
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      const msgId = msg.key.id;
+      if (processedMessages.has(msgId)) continue;
+      processedMessages.add(msgId);
+      if (processedMessages.size > MAX_PROCESSED_CACHE) {
+        const oldest = processedMessages.values().next().value;
+        processedMessages.delete(oldest);
+      }
+
+      try {
+        if (!msg.message || msg.key.fromMe) continue;
+
+        const remoteJid = msg.key.remoteJid;
+        const messageType = Object.keys(msg.message)[0];
+
+        const isImage =
+          messageType === 'imageMessage' ||
+          (messageType === 'viewOnceMessageV2' &&
+            msg.message.viewOnceMessageV2?.message?.imageMessage);
+
+        const isVoiceNote =
+          messageType === 'audioMessage' &&
+          msg.message.audioMessage?.ptt === true;
+
+        if (isImage) {
+          await sock.sendPresenceUpdate('composing', remoteJid);
+          await sock.sendMessage(remoteJid, {
+            text: '🔍 Scanning your plant, one moment...',
+          });
+
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger,
+            reuploadRequest: sock.updateMediaMessage,
+          });
+
+          // Check if the user asked about disease in their caption
+          const caption =
+            msg.message.imageMessage?.caption ||
+            msg.message.viewOnceMessageV2?.message?.imageMessage?.caption || '';
+          const isDiseaseQuery = /disease|condition|sick|infection|infected|pest|blight|rot|wilt|spot|mold|mould|fungus|fungi|affect/i.test(caption);
+
+          if (isDiseaseQuery) {
+            // Run plant ID and disease detection in parallel
+            const [plantResult, diseaseResult] = await Promise.allSettled([
+              identifyPlant(buffer),
+              identifyDisease(buffer),
+            ]);
+
+            const plantMatches = plantResult.status === 'fulfilled' ? plantResult.value : null;
+            const diseases = diseaseResult.status === 'fulfilled' ? diseaseResult.value : null;
+
+            const plantInfo = plantMatches?.[0]
+              ? {
+                  scientificName: plantMatches[0].scientificName,
+                  commonName: plantMatches[0].commonNames[0] || null,
+                  family: plantMatches[0].family,
+                }
+              : null;
+
+            // If plant was identified, show its name first
+            if (plantInfo) {
+              await sock.sendMessage(remoteJid, {
+                text:
+                  `🌿 *Plant identified:* ${plantInfo.commonName || plantInfo.scientificName}` +
+                  ` (_${plantInfo.scientificName}_)\n` +
+                  `*Confidence:* ${plantMatches[0].score}%\n\n` +
+                  `🔬 Running disease analysis...`,
+              });
+            }
+
+            await sock.sendPresenceUpdate('composing', remoteJid);
+
+            if (!diseases || diseases.length === 0 || parseFloat(diseases[0].score) < 5) {
+              await sock.sendMessage(remoteJid, {
+                text: '✅ No significant disease or condition was detected on this plant. It appears healthy! For best results, send a close-up photo of the affected leaf, stem, or fruit.',
+              });
+              continue;
+            }
+
+            // Generate detailed AI disease report
+            const report = await generateDiseaseReport({ diseases, plantInfo });
+
+            if (report) {
+              await sock.sendMessage(remoteJid, { text: sanitizeForWhatsApp(report) });
+            } else {
+              // Fallback to basic formatted result
+              const diseaseText = formatDiseaseResult(diseases);
+              await sock.sendMessage(remoteJid, {
+                text: diseaseText
+                  ? `🦠 *Disease Scan Result:*\n${diseaseText}`
+                  : '⚠️ Disease scan completed but detailed analysis is unavailable right now. Please try again.',
+              });
+            }
+            continue;
+          }
+
+          // Standard plant identification
+          const plantMatches = await identifyPlant(buffer);
+
+          if (!plantMatches) {
+            await sock.sendMessage(remoteJid, { text: NOT_FOUND_MESSAGE });
+            continue;
+          }
+
+          const top = plantMatches[0];
+          const idText = formatHeader(top) + formatAlternates(plantMatches);
+
+          await sock.sendMessage(remoteJid, { text: idText });
+
+          // Then generate and send AI description
+          await sock.sendPresenceUpdate('composing', remoteJid);
+          const description = await generateDescription({
+            scientificName: top.scientificName,
+            commonName: top.commonNames[0],
+            family: top.family,
+            genus: top.genus,
+          });
+
+          const descText = description
+            ? `📖 *About this plant:*\n\n${sanitizeForWhatsApp(description.text)}`
+            : "Couldn't fetch extra details right now, but the identification above is solid. Try again later for the full description.";
+
+          await sock.sendMessage(remoteJid, { text: descText });
+
+          // Save identified plant + bot reply into memory
+          setMemory(remoteJid, {
+            lastPlant: {
+              scientificName: top.scientificName,
+              commonName: top.commonNames[0] || null,
+              family: top.family,
+            },
+          });
+          pushMessage(remoteJid, 'assistant', `${idText}\n\n${descText}`);
+          continue;
+        }
+
+        if (isVoiceNote) {
+          await sock.sendPresenceUpdate('composing', remoteJid);
+          await sock.sendMessage(remoteJid, { text: '🎙️ Got your voice note, give me a moment...' });
+
+          const audioBuffer = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger,
+            reuploadRequest: sock.updateMediaMessage,
+          });
+          const mimeType = msg.message.audioMessage?.mimetype || 'audio/ogg; codecs=opus';
+
+          // Transcribe voice note
+          const transcript = await transcribeAudio(audioBuffer, mimeType);
+          if (!transcript) {
+            await sock.sendMessage(remoteJid, {
+              text: "Sorry, I couldn't make out that voice note. Please try again or type your question.",
+            });
+            continue;
+          }
+
+          // Answer with conversation memory
+          const mem = getMemory(remoteJid);
+          let questionWithContext = transcript;
+          if (mem.lastPlant) {
+            const { commonName, scientificName } = mem.lastPlant;
+            questionWithContext =
+              `[Context: the user previously identified a ${commonName || scientificName} (${scientificName})]\n` +
+              transcript;
+          }
+
+          const answer = await answerQuestion(questionWithContext, mem.messages);
+          const replyText = sanitizeForWhatsApp(answer) ||
+            "I'm only able to help with plant-related questions. Send me a plant photo to identify it, or ask me anything about plants, gardening, or plant care!";
+
+          // Reply as a voice note; fall back to text if TTS fails
+          try {
+            await sock.sendPresenceUpdate('recording', remoteJid);
+            const audioReply = await textToSpeech(replyText);
+            await sock.sendMessage(remoteJid, {
+              audio: audioReply,
+              mimetype: 'audio/ogg; codecs=opus',
+              ptt: true,
+            });
+          } catch (ttsErr) {
+            console.error('TTS failed, falling back to text:', ttsErr.message);
+            await sock.sendMessage(remoteJid, { text: replyText });
+          }
+
+          // Store exchange in memory
+          pushMessage(remoteJid, 'user', transcript);
+          pushMessage(remoteJid, 'assistant', replyText);
+          continue;
+        }
+
+        const text =
+          msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+
+        if (!text) continue;
+
+        const lang = detectLanguage(text.trim());
+        const isGreeting = Object.entries(GREETINGS).some(([, rx]) => rx.test(text.trim()));
+
+        if (isGreeting) {
+          const name = msg.pushName ? msg.pushName.split(' ')[0] : null;
+          await sock.sendMessage(remoteJid, { text: buildGreeting(name, lang) });
+          continue;
+        }
+
+        await sock.sendPresenceUpdate('composing', remoteJid);
+        const mem = getMemory(remoteJid);
+
+        // ── Feature 4: Crop Yield Estimator ──────────────────────────────
+        const farmSizeFromMsg = parseFarmSize(text);
+        const isYieldIntent = YIELD_REGEX.test(text);
+
+        // Clear stale pendingYield if user is clearly asking something unrelated
+        // (a greeting, fertilizer query, or a long message that isn't a size response)
+        if (mem.pendingYield && !farmSizeFromMsg && !isYieldIntent && !parseCropName(text)) {
+          setMemory(remoteJid, { pendingYield: null });
+        }
+
+        const pendingYield = mem.pendingYield || null;
+
+        if (pendingYield) {
+          // We previously asked the user for crop name and/or farm size.
+          // Resolve what we now have from the new message.
+          const resolvedCrop = pendingYield.crop || parseCropName(text) || null;
+          const resolvedSize = farmSizeFromMsg;
+
+          if (resolvedCrop && resolvedSize) {
+            // ✅ Have everything — run the estimator
+            setMemory(remoteJid, { pendingYield: null });
+            await sock.sendMessage(remoteJid, {
+              text: `📊 Estimating yield for *${resolvedCrop}* on *${resolvedSize.size} ${resolvedSize.unit}(s)*...`,
+            });
+            await sock.sendPresenceUpdate('composing', remoteJid);
+            const estimate = await estimateCropYield({ crop: resolvedCrop, farmSize: resolvedSize.size, farmSizeUnit: resolvedSize.unit, lang });
+            const replyText = sanitizeForWhatsApp(estimate) || "Sorry, I couldn't generate the estimate right now. Please try again.";
+            await sock.sendMessage(remoteJid, { text: replyText });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', replyText);
+            continue;
+          } else if (resolvedCrop && !resolvedSize) {
+            // Still missing size — save crop and re-ask
+            setMemory(remoteJid, { pendingYield: { crop: resolvedCrop } });
+            const askMsg =
+              lang === 'ha' ? `📏 Don ƙididdige amfanin gonar *${resolvedCrop}*, faɗa mini girman gonarka (misali: "2 hectares", "1 acre", "4 plots").`
+              : lang === 'ig' ? `📏 Iji nwee ike ịkọwapụta ọrịre *${resolvedCrop}*, biko gwa m nha ugbo gị (dịka: "2 hectares", "1 acre", "4 plots").`
+              : lang === 'yo' ? `📏 Láti ṣe ìṣirò àmọ̀nà *${resolvedCrop}*, jọwọ sọ fún mi ìwọ̀n oko rẹ (fún àpẹẹrẹ: "2 hectares", "1 acre", "4 plots").`
+              : `📏 Got it — *${resolvedCrop}*. Now please tell me your farm size (e.g. "2 hectares", "1 acre", "4 plots").`;
+            await sock.sendMessage(remoteJid, { text: askMsg });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', askMsg);
+            continue;
+          } else {
+            // Still missing crop — re-ask for both
+            setMemory(remoteJid, { pendingYield: {} });
+            const askMsg =
+              lang === 'ha' ? `🌾 Don ƙididdige amfanin gona, faɗa mini: menene amfanin gonarka da girman gonarka? (misali: "Masara, 2 hectares")`
+              : lang === 'ig' ? `🌾 Iji nwee ike ịkọwapụta ọrịre, gwa m: gịnị bụ ihe ọ na-eto na ubi gị na nha ubi gị? (dịka: "Ọka, 2 hectares")`
+              : lang === 'yo' ? `🌾 Láti ṣe ìṣirò àmọ̀nà, jọwọ sọ fún mi: kíni irúgbìn rẹ àti ìwọ̀n oko rẹ? (fún àpẹẹrẹ: "Àgbàdo, 2 hectares")`
+              : `🌾 Please tell me both your crop and farm size (e.g. "Maize, 2 hectares" or "Tomato, 1 acre").`;
+            await sock.sendMessage(remoteJid, { text: askMsg });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', askMsg);
+            continue;
+          }
+        }
+
+        if (isYieldIntent) {
+          const crop = parseCropName(text) || (mem.lastPlant?.commonName) || null;
+          if (crop && farmSizeFromMsg) {
+            // ✅ Both present in first message — estimate immediately
+            await sock.sendMessage(remoteJid, {
+              text: `📊 Estimating yield for *${crop}* on *${farmSizeFromMsg.size} ${farmSizeFromMsg.unit}(s)*...`,
+            });
+            await sock.sendPresenceUpdate('composing', remoteJid);
+            const estimate = await estimateCropYield({ crop, farmSize: farmSizeFromMsg.size, farmSizeUnit: farmSizeFromMsg.unit, lang });
+            const replyText = sanitizeForWhatsApp(estimate) || "Sorry, I couldn't generate the estimate right now. Please try again.";
+            await sock.sendMessage(remoteJid, { text: replyText });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', replyText);
+            continue;
+          } else if (crop && !farmSizeFromMsg) {
+            // Crop known, size missing — ask and save pending
+            setMemory(remoteJid, { pendingYield: { crop } });
+            const askMsg =
+              lang === 'ha' ? `📏 Don ƙididdige amfanin gonar *${crop}*, don Allah faɗa mini girman gonarka (misali: "2 hectares", "1 acre", "4 plots").`
+              : lang === 'ig' ? `📏 Iji nwee ike ịkọwapụta ọrịre *${crop}*, biko gwa m nha ugbo gị (dịka: "2 hectares", "1 acre", "4 plots").`
+              : lang === 'yo' ? `📏 Láti ṣe ìṣirò àmọ̀nà *${crop}*, jọwọ sọ fún mi ìwọ̀n oko rẹ (fún àpẹẹrẹ: "2 hectares", "1 acre", "4 plots").`
+              : `📏 To estimate your *${crop}* yield, please tell me your farm size (e.g. "2 hectares", "1 acre", "4 plots").`;
+            await sock.sendMessage(remoteJid, { text: askMsg });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', askMsg);
+            continue;
+          } else {
+            // Neither crop nor size — ask for both and save pending
+            setMemory(remoteJid, { pendingYield: {} });
+            const askMsg =
+              lang === 'ha' ? `🌾 Don ƙididdige amfanin gona, faɗa mini: menene amfanin gonarka da girman gonarka? (misali: "Masara, 2 hectares")`
+              : lang === 'ig' ? `🌾 Iji nwee ike ịkọwapụta ọrịre, gwa m: gịnị bụ ihe ọ na-eto na ubi gị na nha ubi gị? (dịka: "Ọka, 2 hectares")`
+              : lang === 'yo' ? `🌾 Láti ṣe ìṣirò àmọ̀nà, jọwọ sọ fún mi: kíni irúgbìn rẹ àti ìwọ̀n oko rẹ? (fún àpẹẹrẹ: "Àgbàdo, 2 hectares")`
+              : `🌾 To estimate your crop yield, please tell me: what crop are you growing and what is your farm size? (e.g. "Maize, 2 hectares" or "Tomato, 1 acre")`;
+            await sock.sendMessage(remoteJid, { text: askMsg });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', askMsg);
+            continue;
+          }
+        }
+
+        // ── Feature 3: Fertilizer & Treatment Recommendations ─────────────
+        if (FERTILIZER_REGEX.test(text)) {
+          const crop =
+            parseCropName(text) ||
+            mem.lastPlant?.commonName ||
+            mem.lastPlant?.scientificName ||
+            null;
+
+          if (crop) {
+            await sock.sendMessage(remoteJid, {
+              text: `🧪 Looking up fertilizer and treatment recommendations for *${crop}*...`,
+            });
+            await sock.sendPresenceUpdate('composing', remoteJid);
+            const advice = await generateFertilizerAdvice({ cropOrPlant: crop, question: text });
+            const replyText = sanitizeForWhatsApp(advice) || "Sorry, I couldn't fetch the recommendations right now. Please try again.";
+            await sock.sendMessage(remoteJid, { text: replyText });
+            pushMessage(remoteJid, 'user', text);
+            pushMessage(remoteJid, 'assistant', replyText);
+            continue;
+          }
+          // If no crop found, fall through to general Q&A which handles it naturally
+        }
+
+        // ── General plant/agronomy Q&A ────────────────────────────────────
+        // Prepend last plant context and detected language hint for the AI
+        let questionWithContext = `[User language: ${lang}]\n` + text;
+        if (mem.lastPlant) {
+          const { commonName, scientificName } = mem.lastPlant;
+          questionWithContext =
+            `[User language: ${lang}] [Context: the user previously identified a ${commonName || scientificName} (${scientificName})]\n` +
+            text;
+        }
+
+        const answer = await answerQuestion(questionWithContext, mem.messages);
+        const replyText = sanitizeForWhatsApp(answer) ||
+          (lang === 'ha' ? 'Zan iya taimaka ne kawai game da tsire-tsire da noma. 🌿 Aika mini hoto na tsire ko tambaya ta noma!'
+          : lang === 'ig' ? 'Nwere ike isi m aka naanị n\'ihe gbasara osisi na ọrụ ugbo. 🌿 Ziga foto osisi ma ọ bụ ajụjụ ugbo!'
+          : lang === 'yo' ? 'Mo lè ràn ọ́ lọ́wọ́ nínú ìbéèrè nípa ewéko àti iṣẹ́ àgbẹ̀ nìkan. 🌿 Fi fọto ewéko ránṣẹ́ tàbí béèrè ìbéèrè!'
+          : "I'm only able to help with plant and agriculture-related questions. 🌿 Send me a plant photo to identify it, or ask me anything about plants, crops, farming, or soil!");
+
+        await sock.sendMessage(remoteJid, { text: replyText });
+
+        // Store this exchange in memory
+        pushMessage(remoteJid, 'user', text);
+        pushMessage(remoteJid, 'assistant', replyText);
+      } catch (err) {
+        console.error('Error handling message:', err.response?.status, err.config?.url || err.message);
+        try {
+          await sock.sendMessage(msg.key.remoteJid, {
+            text: '⚠️ Something went wrong identifying that plant. Please try again with a clearer photo.',
+          });
+        } catch (sendErr) {
+          console.error('Failed to send error reply:', sendErr.message);
+        }
+      }
+    }
+  });
+}
+
+startBot().catch((err) => {
+  console.error('Failed to start bot:', err);
+});
