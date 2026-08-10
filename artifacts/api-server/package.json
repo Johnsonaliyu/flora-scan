@@ -7,6 +7,7 @@
     "dev": "export NODE_ENV=development && pnpm run build && pnpm run start",
     "build": "node ./build.mjs",
     "start": "node --enable-source-maps ./dist/index.mjs",
+    "whatsapp:qr": "if test -f .data/whatsapp-qr.txt; then cat .data/whatsapp-qr.txt; else echo 'QR code is not ready. Start the API server first.' >&2; exit 1; fi",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

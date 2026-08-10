@@ -5,6 +5,7 @@ dist
 tmp
 out-tsc
 *.tsbuildinfo
+artifacts/api-server/.data/
 .expo
 .expo-shared
 

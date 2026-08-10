@@ -9,11 +9,15 @@ import {
   type WAMessage,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { logger } from "./logger";
 
 const AUTH_DIR = path.resolve(process.env.WHATSAPP_AUTH_DIR ?? ".data/whatsapp-auth");
+const QR_IMAGE_PATH = path.resolve(process.env.WHATSAPP_QR_PATH ?? ".data/whatsapp-qr.png");
+const QR_TERMINAL_PATH = path.resolve(
+  process.env.WHATSAPP_QR_TERMINAL_PATH ?? ".data/whatsapp-qr.txt",
+);
 const GREETING = `🌿 Good day, Johnson!
 
 I am Flora Scan, your smart plant assistant built by Aliu Johnson Temitope, a fellow of the 3MTT Airtel NextGen Program with fellow ID FE/23/24184818.
@@ -284,10 +288,23 @@ async function startSocket(): Promise<void> {
     if (qr) {
       status.state = "qr";
       status.qr = await QRCode.toDataURL(qr);
+      await mkdir(path.dirname(QR_IMAGE_PATH), { recursive: true });
+      await QRCode.toFile(QR_IMAGE_PATH, qr, { type: "png", width: 512, margin: 2 });
+      const terminalQr = await QRCode.toString(qr, { type: "terminal", small: true });
+      await writeFile(QR_TERMINAL_PATH, terminalQr, "utf8");
+      logger.info(
+        {
+          qrImagePath: QR_IMAGE_PATH,
+          qrTerminalPath: QR_TERMINAL_PATH,
+          qrTerminal: terminalQr,
+        },
+        "WhatsApp QR code is ready; use the terminal QR file or scan the QR shown below",
+      );
     }
     if (connection === "open") {
       status.state = "open";
       status.qr = null;
+      await writeFile(QR_TERMINAL_PATH, "WhatsApp is paired; no QR code is currently required.\n", "utf8");
       status.lastError = null;
       status.phone = socket?.user?.id?.split(":")[0] ?? null;
       logger.info({ phone: status.phone }, "Flora Scan WhatsApp connection open");
