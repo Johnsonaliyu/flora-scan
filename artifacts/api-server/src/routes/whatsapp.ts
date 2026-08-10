@@ -3,6 +3,10 @@ import { clearSession, getBotStatus, getQrDataUrl, startBot } from "../lib/flora
 
 const router: IRouter = Router();
 
+router.get("/", (_req, res) => {
+  res.redirect("/api/whatsapp/pair");
+});
+
 router.get("/whatsapp/status", (_req, res) => {
   res.json(getBotStatus());
 });
