@@ -4,7 +4,7 @@ WhatsApp plant assistant for agronomy questions, plant identification, disease s
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/api-server run dev` — run the API server (managed workflow port)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm run whatsapp:qr` — print the current pairing QR from the API server
