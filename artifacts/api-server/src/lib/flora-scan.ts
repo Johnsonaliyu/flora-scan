@@ -465,8 +465,24 @@ async function sendText(jid: string, text: string): Promise<void> {
   if (socket) await socket.sendMessage(jid, { text: sanitizeForWhatsApp(text) });
 }
 
+async function setTyping(jid: string, typing: boolean): Promise<void> {
+  try {
+    await socket?.sendPresenceUpdate(typing ? "composing" : "paused", jid);
+  } catch (error) {
+    logger.warn({ err: error, jid }, "Could not update WhatsApp typing indicator");
+  }
+}
+
+async function withTyping<T>(jid: string, work: () => Promise<T>): Promise<T> {
+  await setTyping(jid, true);
+  try {
+    return await work();
+  } finally {
+    await setTyping(jid, false);
+  }
+}
+
 async function handleImage(message: WAMessage, jid: string, caption: string): Promise<void> {
-  await socket?.sendPresenceUpdate("composing", jid);
   await sendText(jid, "🔍 Scanning your plant, one moment...");
   const image = await downloadMedia(message, "image");
   if (!image) throw new Error("image could not be downloaded");
@@ -595,15 +611,15 @@ async function handleMessage(message: WAMessage): Promise<void> {
     const image = getImageMessage(message);
     const audio = getAudioMessage(message);
     if (image) {
-      await handleImage(message, jid, getText(message));
+      await withTyping(jid, () => handleImage(message, jid, getText(message)));
       return;
     }
     if (audio?.ptt) {
-      await handleVoice(message, jid);
+      await withTyping(jid, () => handleVoice(message, jid));
       return;
     }
     const text = getText(message);
-    if (text) await handleText(message, jid, text);
+    if (text) await withTyping(jid, () => handleText(message, jid, text));
   } catch (error) {
     logger.error({ err: error, jid }, "Error handling Flora Scan message");
     await sendText(jid, "⚠️ Something went wrong while processing that message. Please try again with a clearer photo or question.");
