@@ -10,6 +10,6 @@ startCommand = "pnpm --filter @workspace/api-server run start"
 sleepApplication = false
 useLegacyStacker = false
 ipv6EgressEnabled = false
-multiRegionConfig = {"sfo":{"numReplicas":1}
+multiRegionConfig = {"sfo":{"numReplicas"=1}
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
