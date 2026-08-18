@@ -382,7 +382,7 @@ function providerKey(provider: Provider): string | undefined {
 }
 
 function providerModel(provider: Provider): string {
-  return provider === "groq" ? process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile" : process.env.NVIDIA_MODEL ?? "meta/llama-3.1-70b-instruct";
+  return provider === "groq" ? process.env.GROQ_MODEL ?? "openai/gpt-oss-120b" : process.env.NVIDIA_MODEL ?? "meta/llama-3.1-70b-instruct";
 }
 
 async function callAI(messages: ChatMessage[], maxTokens = 300): Promise<string | null> {
