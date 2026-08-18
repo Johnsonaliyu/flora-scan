@@ -415,7 +415,7 @@ async function generateDescription(plant: PlantContext): Promise<string | null> 
 }
 
 async function answerQuestion(question: string, history: ChatMessage[] = []): Promise<string | null> {
-  return callAI([{ role: "system", content: QUESTION_SYSTEM_PROMPT }, ...history, { role: "user", content: question }], 400);
+  return callAI([{ role: "system", content: QUESTION_SYSTEM_PROMPT }, ...history, { role: "user", content: question }], 800);
 }
 
 async function generateDiseaseReport(diseases: DiseaseMatch[], plant: PlantContext | null, question: string): Promise<string | null> {
@@ -424,15 +424,15 @@ async function generateDiseaseReport(diseases: DiseaseMatch[], plant: PlantConte
   return callAI([
     { role: "system", content: DISEASE_SYSTEM_PROMPT },
     { role: "user", content: `User message: ${question || "Please assess this photo."}\nPlant: ${plant?.commonName ?? plant?.scientificName ?? "unknown"} (${plant?.scientificName ?? "unknown"})\nTop condition: ${top?.description ?? top?.name ?? "unknown"} (${top?.score ?? "unknown"}%)\nOther PlantNet results: ${results}\nWrite the full report now.` },
-  ], 600);
+  ], 1100);
 }
 
 async function generateFertilizerAdvice(cropOrPlant: string, question: string): Promise<string | null> {
-  return callAI([{ role: "system", content: FERTILIZER_SYSTEM_PROMPT }, { role: "user", content: `Crop/plant: ${cropOrPlant}\nUser question: ${question}\nWrite the recommendations now.` }], 500);
+  return callAI([{ role: "system", content: FERTILIZER_SYSTEM_PROMPT }, { role: "user", content: `Crop/plant: ${cropOrPlant}\nUser question: ${question}\nWrite the recommendations now.` }], 1000);
 }
 
 async function estimateCropYield(crop: string, farmSize: { size: number; unit: string }, language: Language): Promise<string | null> {
-  return callAI([{ role: "system", content: YIELD_SYSTEM_PROMPT }, { role: "user", content: `[User language: ${language}]\nCrop: ${crop}\nFarm size: ${farmSize.size} ${farmSize.unit}(s)\nProvide the yield, input cost, and profit estimate now.` }], 600);
+  return callAI([{ role: "system", content: YIELD_SYSTEM_PROMPT }, { role: "user", content: `[User language: ${language}]\nCrop: ${crop}\nFarm size: ${farmSize.size} ${farmSize.unit}(s)\nProvide the yield, input cost, and profit estimate now.` }], 1000);
 }
 
 async function transcribeAudio(audio: Buffer, mimetype: string): Promise<string | null> {
